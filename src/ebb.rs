@@ -17,12 +17,12 @@ impl EbbD {
     /// Every interval, computes how much memory to reclaim from the cgroup and asks the
     /// kernel to reclaim it (TMO, §3.3).
     pub fn memory(&self, config: &MemConfig) -> Result<()> {
-        let mut prev_stall = self.cgroup.memory_pressure()?;
+        let mut prev_stall = self.cgroup.memory.some_total()?;
         let mut prev_at = Instant::now();
         loop {
             thread::sleep(Duration::from_secs(config.interval));
-            let current = self.cgroup.memory_current()?;
-            let stall = self.cgroup.memory_pressure()?;
+            let current = self.cgroup.memory.current()?;
+            let stall = self.cgroup.memory.some_total()?;
             let now = Instant::now();
             // Share of the period at least one task was stalled on memory.
             let pressure = stall.saturating_sub(prev_stall).as_secs_f64()
@@ -37,7 +37,7 @@ impl EbbD {
             );
             // Less than a page isn't worth a syscall.
             if reclaim >= 4096 {
-                self.cgroup.memory_reclaim(reclaim)?;
+                self.cgroup.memory.reclaim(reclaim)?;
             }
             println!(
                 "current={current} pressure={:.4}% reclaim={reclaim}",

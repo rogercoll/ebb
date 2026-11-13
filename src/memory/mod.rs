@@ -1,5 +1,6 @@
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
+    io,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     time::Duration,
@@ -7,23 +8,29 @@ use std::{
 
 use crate::error::{Error, Result};
 
-/// The cgroup's memory files, kept open so each tick is a single `pread`.
+/// The cgroup's memory files, kept open so each tick is a single `pread`/`pwrite` per file.
 pub struct CgroupMemory {
     dir: PathBuf,
     pressure: File,
     current: File,
+    reclaim: File,
 }
 
 impl CgroupMemory {
     pub(crate) fn open(dir: &Path) -> Result<Self> {
-        let open = |file: &str| {
+        let open = |file: &str, write: bool| {
             let path = dir.join(file);
-            File::open(&path).map_err(|source| Error::Io { path, source })
+            OpenOptions::new()
+                .read(!write)
+                .write(write)
+                .open(&path)
+                .map_err(|source| Error::Io { path, source })
         };
         Ok(Self {
             dir: dir.to_owned(),
-            pressure: open("memory.pressure")?,
-            current: open("memory.current")?,
+            pressure: open("memory.pressure", false)?,
+            current: open("memory.current", false)?,
+            reclaim: open("memory.reclaim", true)?,
         })
     }
 
@@ -55,6 +62,19 @@ impl CgroupMemory {
                 file: "memory.current",
                 field: "bytes",
             })
+    }
+
+    /// Asks the kernel to reclaim `bytes` from the cgroup, once, without setting a limit.
+    pub(crate) fn reclaim(&self, bytes: u64) -> Result<()> {
+        match self.reclaim.write_all_at(bytes.to_string().as_bytes(), 0) {
+            // EAGAIN: the kernel couldn't reclaim all of it (e.g. nothing reclaimable is
+            // left). That's a normal outcome, not an error.
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            result => result.map_err(|source| Error::Io {
+                path: self.dir.join("memory.reclaim"),
+                source,
+            }),
+        }
     }
 
     /// Reads the whole file from the start. cgroup files regenerate their contents on
@@ -89,6 +109,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("memory.pressure"), pressure).unwrap();
         std::fs::write(dir.join("memory.current"), current).unwrap();
+        std::fs::write(dir.join("memory.reclaim"), "").unwrap();
         let memory = CgroupMemory::open(&dir).unwrap();
         // The open files stay readable after the directory is gone.
         std::fs::remove_dir_all(&dir).unwrap();
