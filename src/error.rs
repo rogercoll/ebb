@@ -16,4 +16,11 @@ pub enum Error {
     /// Reading a cgroup file failed.
     #[error("{}: {source}", path.display())]
     Io { path: PathBuf, source: io::Error },
+
+    /// A syscall failed (epoll, timerfd).
+    #[error("{op}: {source}")]
+    Os {
+        op: &'static str,
+        source: rustix::io::Errno,
+    },
 }

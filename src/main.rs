@@ -1,6 +1,7 @@
 mod cgroup;
 mod ebb;
 mod error;
+mod event;
 mod io;
 mod memory;
 mod psi;
