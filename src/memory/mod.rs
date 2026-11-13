@@ -6,12 +6,15 @@ use std::{
     time::Duration,
 };
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    psi::Psi,
+};
 
 /// The cgroup's memory files, kept open so each tick is a single `pread`/`pwrite` per file.
 pub struct CgroupMemory {
     dir: PathBuf,
-    pressure: File,
+    pressure: Psi,
     current: File,
     reclaim: File,
 }
@@ -28,27 +31,15 @@ impl CgroupMemory {
         };
         Ok(Self {
             dir: dir.to_owned(),
-            pressure: open("memory.pressure", false)?,
+            pressure: Psi::open(dir, "memory.pressure")?,
             current: open("memory.current", false)?,
             reclaim: open("memory.reclaim", true)?,
         })
     }
 
     /// Time at least one task in the cgroup was stalled on memory, since it was created.
-    // some avg10=0.00 avg60=0.00 avg300=0.00 total=106340
-    // full avg10=0.00 avg60=0.00 avg300=0.00 total=0
     pub(crate) fn some_total(&self) -> Result<Duration> {
-        let mut buf = [0; 256];
-        self.read(&self.pressure, "memory.pressure", &mut buf)?
-            .lines()
-            .find_map(|line| line.strip_prefix("some "))
-            .and_then(|line| line.rsplit_once("total="))
-            .and_then(|(_, us)| us.trim().parse().ok())
-            .map(Duration::from_micros)
-            .ok_or(Error::Parse {
-                file: "memory.pressure",
-                field: "some total=",
-            })
+        self.pressure.some_total()
     }
 
     /// Memory charged to the cgroup, in bytes.

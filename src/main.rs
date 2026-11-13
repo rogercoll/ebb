@@ -1,7 +1,9 @@
 mod cgroup;
 mod ebb;
 mod error;
+mod io;
 mod memory;
+mod psi;
 
 use std::{path::PathBuf, process::ExitCode};
 
@@ -17,6 +19,9 @@ struct Args {
 
     #[command(flatten)]
     mem: MemConfig,
+
+    #[command(flatten)]
+    io: IoConfig,
 }
 
 /// Memory reclaim settings. Defaults are the production values from the TMO paper (§3.3).
@@ -35,6 +40,15 @@ pub struct MemConfig {
     pub interval: u64,
 }
 
+/// IO pressure gate: no reclaim while IO pressure is above the threshold, since refaults
+/// can slow the device without showing up as memory stalls.
+#[derive(clap::Args)]
+pub struct IoConfig {
+    /// IO "some" pressure at which reclaim stops, as a fraction of time stalled (0.001 = 0.1%)
+    #[arg(id = "io_psi_threshold", long = "io-psi-threshold", value_name = "IO_PSI_THRESHOLD", env = "EBBD_IO_PSI_THRESHOLD", default_value_t = 0.001, value_parser = positive)]
+    pub psi_threshold: f64,
+}
+
 fn positive(s: &str) -> std::result::Result<f64, String> {
     match s.parse::<f64>() {
         Ok(v) if v > 0.0 && v.is_finite() => Ok(v),
@@ -44,11 +58,22 @@ fn positive(s: &str) -> std::result::Result<f64, String> {
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    match Cgroup::new(args.cgroup).and_then(|cgroup| EbbD::new(cgroup).memory(&args.mem)) {
+    match Cgroup::new(args.cgroup).and_then(|cgroup| EbbD::new(cgroup).memory(&args.mem, &args.io))
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("ebbd: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_is_valid() {
+        super::Args::command().debug_assert();
     }
 }
