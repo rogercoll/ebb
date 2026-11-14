@@ -6,17 +6,26 @@ mod io;
 mod memory;
 mod psi;
 
-use std::{path::PathBuf, process::ExitCode};
+use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::Parser;
+use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
 
-use crate::{cgroup::Cgroup, ebb::EbbD};
+use crate::ebb::{EbbD, Target};
 
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
     /// cgroup v2 directory, e.g. /sys/fs/cgroup/user.slice
     cgroup: PathBuf,
+
+    /// Reclaim from every leaf cgroup under CGROUP instead of CGROUP itself
+    #[arg(long)]
+    leaves: bool,
+
+    /// Seconds between scans for new and removed leaves (with --leaves)
+    #[arg(long, env = "EBBD_RESCAN_INTERVAL", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    rescan_interval: u64,
 
     #[command(flatten)]
     mem: MemConfig,
@@ -59,8 +68,25 @@ fn positive(s: &str) -> std::result::Result<f64, String> {
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    match Cgroup::new(args.cgroup).and_then(|cgroup| EbbD::new(cgroup).memory(&args.mem, &args.io))
-    {
+    // Each cgroup keeps 5 fds open, so the usual soft limit of 1024 runs out at ~200.
+    let nofile = getrlimit(Resource::Nofile);
+    let raised = Rlimit {
+        current: nofile.maximum,
+        ..nofile
+    };
+    if let Err(err) = setrlimit(Resource::Nofile, raised) {
+        eprintln!("ebbd: raising the open file limit: {err}");
+    }
+
+    let target = if args.leaves {
+        Target::Leaves {
+            root: args.cgroup,
+            rescan: Duration::from_secs(args.rescan_interval),
+        }
+    } else {
+        Target::Cgroup(args.cgroup)
+    };
+    match EbbD::new(target, args.mem, args.io).and_then(|mut ebbd| ebbd.memory()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("ebbd: {err}");
