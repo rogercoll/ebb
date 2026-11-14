@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     hash::{BuildHasher, RandomState},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -13,39 +13,34 @@ use crate::{
     IoConfig, MemConfig,
 };
 
-pub enum Target {
-    Cgroup(PathBuf),
-    Leaves { root: PathBuf, rescan: Duration },
-}
-
-pub struct EbbD {
+pub struct EbbD<F> {
     mem: MemConfig,
     io: IoConfig,
     period: Duration,
     poller: Poller,
-    // Only with --leaves. Errors then drop the cgroup instead of stopping the daemon.
-    tree: Option<CgroupTree>,
+    tree: CgroupTree<F>,
     reclaimers: HashMap<Token, Reclaimer>,
 }
 
-impl EbbD {
-    pub fn new(target: Target, mem: MemConfig, io: IoConfig) -> Result<Self> {
-        let period = Duration::from_secs(mem.interval);
+impl<F: Fn(&Path) -> bool> EbbD<F> {
+    pub(crate) fn new(
+        tree: CgroupTree<F>,
+        rescan: Duration,
+        mem: MemConfig,
+        io: IoConfig,
+    ) -> Result<Self> {
         let mut ebbd = Self {
+            period: Duration::from_secs(mem.interval),
             mem,
             io,
-            period,
             poller: Poller::new()?,
-            tree: None,
+            tree,
             reclaimers: HashMap::new(),
         };
-        match target {
-            Target::Cgroup(path) => ebbd.track(Reclaimer::new(path)?, period)?,
-            Target::Leaves { root, rescan } => {
-                ebbd.poller.add_rescan(rescan)?;
-                ebbd.tree = Some(CgroupTree::new(root));
-                ebbd.rescan()?;
-            }
+        ebbd.poller.add_rescan(rescan)?;
+        ebbd.rescan()?;
+        if ebbd.reclaimers.is_empty() {
+            eprintln!("ebbd: no leaf cgroups to reclaim yet, rescanning every {rescan:?}");
         }
         Ok(ebbd)
     }
@@ -72,20 +67,14 @@ impl EbbD {
         let Err(err) = reclaimer.tick(&self.mem, &self.io) else {
             return Ok(());
         };
-        let Some(tree) = &mut self.tree else {
-            return Err(err);
-        };
         eprintln!("ebbd: dropping {}: {err}", reclaimer.path.display());
         // So the next rescan adds it back if it's still, or again, a leaf.
-        tree.forget(&reclaimer.path);
+        self.tree.forget(&reclaimer.path);
         self.untrack(token)
     }
 
     fn rescan(&mut self) -> Result<()> {
-        let Some(tree) = &mut self.tree else {
-            return Ok(());
-        };
-        for leaf in tree.rescan()? {
+        for leaf in self.tree.rescan()? {
             match leaf {
                 Leaf::Removed(path) => {
                     let token = self.reclaimers.iter().find(|(_, r)| r.path == path);

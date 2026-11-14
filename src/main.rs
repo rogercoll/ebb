@@ -6,24 +6,37 @@ mod io;
 mod memory;
 mod psi;
 
-use std::{path::PathBuf, process::ExitCode, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::ExitCode,
+    time::Duration,
+};
 
 use clap::Parser;
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
 
-use crate::ebb::{EbbD, Target};
+use crate::{
+    cgroup::{filter, CgroupTree},
+    ebb::EbbD,
+};
 
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// cgroup v2 directory, e.g. /sys/fs/cgroup/user.slice
+    /// cgroup v2 directory whose leaf cgroups are reclaimed, e.g. /sys/fs/cgroup/kubepods.slice
     cgroup: PathBuf,
 
-    /// Reclaim from every leaf cgroup under CGROUP instead of CGROUP itself
-    #[arg(long)]
-    leaves: bool,
+    /// Only reclaim leaves whose path under CGROUP matches GLOB, e.g. */*/cri-containerd-*.scope.
+    /// `*` and `?` match within one path component. Can be repeated
+    #[arg(
+        long = "match",
+        value_name = "GLOB",
+        env = "EBBD_MATCH",
+        value_delimiter = ','
+    )]
+    globs: Vec<String>,
 
-    /// Seconds between scans for new and removed leaves (with --leaves)
+    /// Seconds between scans for new and removed leaves
     #[arg(long, env = "EBBD_RESCAN_INTERVAL", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     rescan_interval: u64,
 
@@ -78,15 +91,18 @@ fn main() -> ExitCode {
         eprintln!("ebbd: raising the open file limit: {err}");
     }
 
-    let target = if args.leaves {
-        Target::Leaves {
-            root: args.cgroup,
-            rescan: Duration::from_secs(args.rescan_interval),
-        }
-    } else {
-        Target::Cgroup(args.cgroup)
-    };
-    match EbbD::new(target, args.mem, args.io).and_then(|mut ebbd| ebbd.memory()) {
+    let tree = CgroupTree::new(&args.cgroup, |path: &Path| {
+        filter::glob(&args.cgroup, &args.globs, path) && filter::populated(path)
+    });
+
+    match EbbD::new(
+        tree,
+        Duration::from_secs(args.rescan_interval),
+        args.mem,
+        args.io,
+    )
+    .and_then(|mut ebbd| ebbd.memory())
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("ebbd: {err}");
