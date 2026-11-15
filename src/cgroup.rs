@@ -53,10 +53,7 @@ impl<F: Fn(&Path) -> bool> CgroupTree<F> {
 
     pub(crate) fn rescan(&mut self) -> Result<Vec<Leaf>> {
         // Leaves may vanish mid-scan, but a missing root is an error.
-        fs::metadata(&self.root).map_err(|source| Error::Io {
-            path: self.root.clone(),
-            source,
-        })?;
+        fs::metadata(&self.root).map_err(Error::io(&self.root))?;
         let mut leaves = BTreeSet::new();
         self.collect_leaves(&self.root, &mut leaves)?;
         let removed = self.leaves.difference(&leaves).cloned().map(Leaf::Removed);
@@ -74,19 +71,15 @@ impl<F: Fn(&Path) -> bool> CgroupTree<F> {
     /// Adds `dir` to `leaves` if it has no child cgroups and passes the filter, otherwise
     /// recurses into its children.
     fn collect_leaves(&self, dir: &Path, leaves: &mut BTreeSet<PathBuf>) -> Result<()> {
-        let io_err = |source| Error::Io {
-            path: dir.to_owned(),
-            source,
-        };
         let entries = match fs::read_dir(dir) {
             // Removed while scanning: it'll be gone from the next scan too.
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-            result => result.map_err(io_err)?,
+            result => result.map_err(Error::io(dir))?,
         };
         let mut has_children = false;
         for entry in entries {
-            let entry = entry.map_err(io_err)?;
-            if entry.file_type().map_err(io_err)?.is_dir() {
+            let entry = entry.map_err(Error::io(dir))?;
+            if entry.file_type().map_err(Error::io(dir))?.is_dir() {
                 has_children = true;
                 self.collect_leaves(&entry.path(), leaves)?;
             }

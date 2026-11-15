@@ -1,4 +1,7 @@
-use std::{io, path::PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use thiserror::Error;
 
@@ -23,4 +26,18 @@ pub enum Error {
         op: &'static str,
         source: rustix::io::Errno,
     },
+}
+
+impl Error {
+    /// For `map_err`. Copies `path` only if there is an error.
+    pub(crate) fn io(path: &Path) -> impl FnOnce(io::Error) -> Self + '_ {
+        move |source| Self::Io {
+            path: path.to_owned(),
+            source,
+        }
+    }
+
+    pub(crate) fn os(op: &'static str) -> impl FnOnce(rustix::io::Errno) -> Self {
+        move |source| Self::Os { op, source }
+    }
 }

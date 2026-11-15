@@ -2,8 +2,10 @@ mod cgroup;
 mod ebb;
 mod error;
 mod event;
+mod file;
 mod io;
 mod memory;
+mod policy;
 mod psi;
 
 use std::{
@@ -18,6 +20,7 @@ use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
 use crate::{
     cgroup::{filter, CgroupTree},
     ebb::EbbD,
+    policy::Pressure,
 };
 
 #[derive(Parser)]
@@ -95,11 +98,19 @@ fn main() -> ExitCode {
         filter::glob(&args.cgroup, &args.globs, path) && filter::populated(path)
     });
 
+    let policy = |pressure: Pressure, current: u64| {
+        if policy::io_ok(&args.io, pressure) {
+            policy::tmo(&args.mem, pressure, current)
+        } else {
+            0
+        }
+    };
+
     match EbbD::new(
         tree,
+        policy,
+        Duration::from_secs(args.mem.interval),
         Duration::from_secs(args.rescan_interval),
-        args.mem,
-        args.io,
     )
     .and_then(|mut ebbd| ebbd.memory())
     {

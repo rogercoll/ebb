@@ -9,32 +9,31 @@ use crate::{
     cgroup::{Cgroup, CgroupTree, Leaf},
     error::Result,
     event::{Event, Poller, Token},
-    memory::CgroupMemory,
-    IoConfig, MemConfig,
+    policy::Pressure,
 };
 
-pub struct EbbD<F> {
-    mem: MemConfig,
-    io: IoConfig,
+pub struct EbbD<F, P> {
     period: Duration,
     poller: Poller,
     tree: CgroupTree<F>,
+    policy: P,
     reclaimers: HashMap<Token, Reclaimer>,
 }
 
-impl<F: Fn(&Path) -> bool> EbbD<F> {
+impl<F: Fn(&Path) -> bool, P: Fn(Pressure, u64) -> u64> EbbD<F, P> {
+    /// `policy` gets each period's pressure and `memory.current`, and returns the bytes to
+    /// reclaim.
     pub(crate) fn new(
         tree: CgroupTree<F>,
+        policy: P,
+        period: Duration,
         rescan: Duration,
-        mem: MemConfig,
-        io: IoConfig,
     ) -> Result<Self> {
         let mut ebbd = Self {
-            period: Duration::from_secs(mem.interval),
-            mem,
-            io,
+            period,
             poller: Poller::new()?,
             tree,
+            policy,
             reclaimers: HashMap::new(),
         };
         ebbd.poller.add_rescan(rescan)?;
@@ -45,9 +44,8 @@ impl<F: Fn(&Path) -> bool> EbbD<F> {
         Ok(ebbd)
     }
 
-    /// Every interval, computes how much memory to reclaim from each cgroup and asks the
-    /// kernel to reclaim it (TMO, §3.3). Skips the period while IO pressure is at or above
-    /// its threshold.
+    /// Every period, asks the policy how much memory to reclaim from each cgroup and asks the
+    /// kernel to reclaim it.
     pub fn memory(&mut self) -> Result<()> {
         loop {
             for event in self.poller.wait()? {
@@ -64,7 +62,7 @@ impl<F: Fn(&Path) -> bool> EbbD<F> {
         let Some(reclaimer) = self.reclaimers.get_mut(&token) else {
             return Ok(());
         };
-        let Err(err) = reclaimer.tick(&self.mem, &self.io) else {
+        let Err(err) = reclaimer.tick(&self.policy) else {
             return Ok(());
         };
         eprintln!("ebbd: dropping {}: {err}", reclaimer.path.display());
@@ -77,8 +75,11 @@ impl<F: Fn(&Path) -> bool> EbbD<F> {
         for leaf in self.tree.rescan()? {
             match leaf {
                 Leaf::Removed(path) => {
-                    let token = self.reclaimers.iter().find(|(_, r)| r.path == path);
-                    if let Some(&token) = token.map(|(token, _)| token) {
+                    let token = self
+                        .reclaimers
+                        .iter()
+                        .find_map(|(&token, r)| (r.path == path).then_some(token));
+                    if let Some(token) = token {
                         self.untrack(token)?;
                     }
                 }
@@ -123,25 +124,13 @@ impl Reclaimer {
         Ok(Self { path, cgroup, prev })
     }
 
-    fn tick(&mut self, config: &MemConfig, io: &IoConfig) -> Result<()> {
+    fn tick(&mut self, policy: &impl Fn(Pressure, u64) -> u64) -> Result<()> {
         let current = self.cgroup.memory.current()?;
         let now = Sample::read(&self.cgroup)?;
-        // Share of the period at least one task was stalled on memory / IO.
-        let elapsed = now.at.duration_since(self.prev.at).as_secs_f64();
-        let pressure = now.memory.saturating_sub(self.prev.memory).as_secs_f64() / elapsed;
-        let io_pressure = now.io.saturating_sub(self.prev.io).as_secs_f64() / elapsed;
+        let pressure = now.pressure_since(&self.prev);
         self.prev = now;
 
-        let reclaim = if io_pressure >= io.psi_threshold {
-            0
-        } else {
-            CgroupMemory::reclaim_amount(
-                current,
-                pressure,
-                config.reclaim_ratio,
-                config.psi_threshold,
-            )
-        };
+        let reclaim = policy(pressure, current);
         // Less than a page isn't worth a syscall.
         if reclaim >= 4096 {
             self.cgroup.memory.reclaim(reclaim)?;
@@ -149,8 +138,8 @@ impl Reclaimer {
         println!(
             "{} current={current} pressure={:.4}% io_pressure={:.4}% reclaim={reclaim}",
             self.path.display(),
-            pressure * 100.0,
-            io_pressure * 100.0
+            pressure.memory * 100.0,
+            pressure.io * 100.0
         );
         Ok(())
     }
@@ -169,5 +158,16 @@ impl Sample {
             io: cgroup.io.some_total()?,
             at: Instant::now(),
         })
+    }
+
+    /// Share of the time since `prev` at least one task was stalled on memory / IO.
+    fn pressure_since(&self, prev: &Sample) -> Pressure {
+        let elapsed = self.at.duration_since(prev.at).as_secs_f64();
+        let share =
+            |now: Duration, prev: Duration| now.saturating_sub(prev).as_secs_f64() / elapsed;
+        Pressure {
+            memory: share(self.memory, prev.memory),
+            io: share(self.io, prev.io),
+        }
     }
 }

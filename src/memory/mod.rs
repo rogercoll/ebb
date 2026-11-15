@@ -1,92 +1,46 @@
-use std::{
-    fs::{File, OpenOptions},
-    io,
-    os::unix::fs::FileExt,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{io, path::Path, time::Duration};
 
 use crate::{
     error::{Error, Result},
-    psi::Psi,
+    file::CgroupFile,
+    psi,
 };
 
-/// The cgroup's memory files, kept open so each tick is a single `pread`/`pwrite` per file.
+/// The cgroup's memory files, kept open.
 pub struct CgroupMemory {
-    dir: PathBuf,
-    pressure: Psi,
-    current: File,
-    reclaim: File,
+    pressure: CgroupFile,
+    current: CgroupFile,
+    reclaim: CgroupFile,
 }
 
 impl CgroupMemory {
     pub(crate) fn open(dir: &Path) -> Result<Self> {
-        let open = |file: &str, write: bool| {
-            let path = dir.join(file);
-            OpenOptions::new()
-                .read(!write)
-                .write(write)
-                .open(&path)
-                .map_err(|source| Error::Io { path, source })
-        };
         Ok(Self {
-            dir: dir.to_owned(),
-            pressure: Psi::open(dir, "memory.pressure")?,
-            current: open("memory.current", false)?,
-            reclaim: open("memory.reclaim", true)?,
+            pressure: CgroupFile::open(dir, "memory.pressure")?,
+            current: CgroupFile::open(dir, "memory.current")?,
+            reclaim: CgroupFile::open_write(dir, "memory.reclaim")?,
         })
     }
 
     /// Time at least one task in the cgroup was stalled on memory, since it was created.
     pub(crate) fn some_total(&self) -> Result<Duration> {
-        self.pressure.some_total()
+        self.pressure.read("some total=", psi::some_total)
     }
 
     /// Memory charged to the cgroup, in bytes.
     // 263462912
     pub(crate) fn current(&self) -> Result<u64> {
-        let mut buf = [0; 32];
-        self.read(&self.current, "memory.current", &mut buf)?
-            .trim()
-            .parse()
-            .map_err(|_| Error::Parse {
-                file: "memory.current",
-                field: "bytes",
-            })
+        self.current.read("bytes", |data| data.trim().parse().ok())
     }
 
     /// Asks the kernel to reclaim `bytes` from the cgroup, once, without setting a limit.
     pub(crate) fn reclaim(&self, bytes: u64) -> Result<()> {
-        match self.reclaim.write_all_at(bytes.to_string().as_bytes(), 0) {
+        match self.reclaim.write(bytes.to_string().as_bytes()) {
             // EAGAIN: the kernel couldn't reclaim all of it (e.g. nothing reclaimable is
             // left). That's a normal outcome, not an error.
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
-            result => result.map_err(|source| Error::Io {
-                path: self.dir.join("memory.reclaim"),
-                source,
-            }),
+            Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            result => result,
         }
-    }
-
-    /// Reads the whole file from the start. cgroup files regenerate their contents on
-    /// every read at offset 0.
-    fn read<'a>(&self, file: &File, name: &'static str, buf: &'a mut [u8]) -> Result<&'a str> {
-        let n = file.read_at(buf, 0).map_err(|source| Error::Io {
-            path: self.dir.join(name),
-            source,
-        })?;
-        std::str::from_utf8(&buf[..n]).map_err(|_| Error::Parse {
-            file: name,
-            field: "utf-8",
-        })
-    }
-
-    /// Bytes to reclaim this period (TMO, §3.3):
-    /// `current × ratio × max(0, 1 − pressure / threshold)`.
-    ///
-    /// `pressure` and `threshold` are fractions of wall time stalled (0.001 = 0.1%).
-    pub(crate) fn reclaim_amount(current: u64, pressure: f64, ratio: f64, threshold: f64) -> u64 {
-        (current as f64 * ratio * (1.0 - pressure / threshold).max(0.0)) as u64
     }
 }
 
@@ -121,23 +75,5 @@ mod tests {
         let memory = fake_cgroup("garbage", "garbage", "garbage");
         assert!(memory.some_total().is_err());
         assert!(memory.current().is_err());
-    }
-
-    #[test]
-    fn reclaim_amount() {
-        let gib = 1 << 30;
-        // No pressure: the full ratio.
-        assert_eq!(
-            CgroupMemory::reclaim_amount(gib, 0.0, 0.01, 0.001),
-            gib / 100
-        );
-        // Halfway to the threshold: half of it.
-        assert_eq!(
-            CgroupMemory::reclaim_amount(gib, 0.0005, 0.01, 0.001),
-            gib / 200
-        );
-        // At or above the threshold: nothing.
-        assert_eq!(CgroupMemory::reclaim_amount(gib, 0.001, 0.01, 0.001), 0);
-        assert_eq!(CgroupMemory::reclaim_amount(gib, 0.5, 0.01, 0.001), 0);
     }
 }
